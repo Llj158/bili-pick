@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">视频下载软件标志</title>
+  <desc id="desc">粉色圆角小电视，带有俏皮天线、白色屏幕、蓝色下载箭头和粉色承接托盘。</desc>
+  <g stroke="#FB7299" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M179 116 139 70M324 116 364 70"/>
+    <rect x="69" y="124" width="374" height="286" rx="58" fill="white"/>
+    <path d="M157 412 145 442M355 412 367 442"/>
+  </g>
+  <path d="m130 216 28-13m224 13-28-13" stroke="#FB7299" stroke-width="19" stroke-linecap="round"/>
+  <path d="M256 207v103m-42-38 42 42 42-42" stroke="#00AEEC" stroke-width="27" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M182 332v19a15 15 0 0 0 15 15h118a15 15 0 0 0 15-15v-19" stroke="#FB7299" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
