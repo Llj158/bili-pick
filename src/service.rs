@@ -1,7 +1,7 @@
 use crate::bilibili::{
-    ApiError, InputTarget, PlayData, QrLogin, QrState, Quality, SeasonPage, VideoInfo, parse_input,
-    parse_play_response, parse_qr_generate, parse_qr_poll, parse_season_response,
-    parse_view_response,
+    ApiError, InputTarget, PlayData, QrLogin, QrState, Quality, SeasonPage, VideoInfo,
+    parse_bangumi_response, parse_input, parse_media_season_id, parse_play_response,
+    parse_qr_generate, parse_qr_poll, parse_season_response, parse_view_response,
 };
 use crate::download::DownloadItem;
 use crate::http::{HttpClient, HttpError};
@@ -83,10 +83,22 @@ impl BiliClient {
         parse_season_response(&body, season_id)
     }
 
-    pub fn play(&mut self, bvid: &str, cid: u64, quality: u32) -> Result<PlayData, ApiError> {
-        let body = self.get_json(&format!(
-            "{API_ROOT}/x/player/playurl?bvid={bvid}&cid={cid}&qn={quality}&fnval=4048&fnver=0&fourk=1"
-        ))?;
+    pub fn play(
+        &mut self,
+        bvid: &str,
+        cid: u64,
+        quality: u32,
+        ep_id: Option<u64>,
+    ) -> Result<PlayData, ApiError> {
+        let url = match ep_id {
+            Some(id) => format!(
+                "{API_ROOT}/pgc/player/web/v2/playurl?ep_id={id}&cid={cid}&qn={quality}&fnval=4048&fnver=0&fourk=1"
+            ),
+            None => format!(
+                "{API_ROOT}/x/player/playurl?bvid={bvid}&cid={cid}&qn={quality}&fnval=4048&fnver=0&fourk=1"
+            ),
+        };
+        let body = self.get_json(&url)?;
         let result = parse_play_response(&body);
         if matches!(result, Err(ApiError::LoginRequired)) {
             self.authenticated = false;
@@ -174,9 +186,47 @@ impl BiliClient {
                 }
                 (format!("合集 {season_id}"), true)
             }
+            target @ (InputTarget::BangumiEpisode(_)
+            | InputTarget::BangumiSeason(_)
+            | InputTarget::BangumiMedia(_)) => {
+                let query = match target {
+                    InputTarget::BangumiEpisode(id) => format!("ep_id={id}"),
+                    InputTarget::BangumiSeason(id) => format!("season_id={id}"),
+                    InputTarget::BangumiMedia(id) => {
+                        let body =
+                            self.get_json(&format!("{API_ROOT}/pgc/review/user?media_id={id}"))?;
+                        format!("season_id={}", parse_media_season_id(&body)?)
+                    }
+                    _ => unreachable!(),
+                };
+                let body = self.get_json(&format!("{API_ROOT}/pgc/view/web/season?{query}"))?;
+                let info = parse_bangumi_response(&body)?;
+                let single_episode = matches!(target, InputTarget::BangumiEpisode(_));
+                for episode in info.episodes {
+                    if let InputTarget::BangumiEpisode(id) = target
+                        && id != episode.id
+                    {
+                        continue;
+                    }
+                    let sequence = items.len() as u32 + 1;
+                    items.push(DownloadItem {
+                        bvid: episode.bvid,
+                        ep_id: Some(episode.id),
+                        title: info.title.clone(),
+                        part: episode.title,
+                        page: sequence,
+                        cid: episode.cid,
+                        duration: episode.duration,
+                        sequence,
+                    });
+                }
+                (info.title, !single_episode)
+            }
         };
         if items.is_empty() {
-            return Err(ApiError::Message("没有解析到可下载的分 P".to_string()));
+            return Err(ApiError::Message(
+                "没有解析到可下载的分 P 或剧集，内容可能尚未上线".to_string(),
+            ));
         }
         if !is_collection && !items.iter().any(|item| item.page == parsed.page) {
             return Err(ApiError::Message(format!(
@@ -185,7 +235,7 @@ impl BiliClient {
             )));
         }
         let first = &items[0];
-        let (qualities, access_notice) = match self.play(&first.bvid, first.cid, 80) {
+        let (qualities, access_notice) = match self.play(&first.bvid, first.cid, 80, first.ep_id) {
             Ok(play) if !play.qualities.is_empty() => (play.qualities, None),
             Ok(_) => (default_qualities(), None),
             Err(error) => (default_qualities(), Some(error.to_string())),
@@ -259,6 +309,7 @@ pub fn expand_video(info: VideoInfo, first_sequence: u32) -> Vec<DownloadItem> {
         .enumerate()
         .map(|(index, page)| DownloadItem {
             bvid: info.bvid.clone(),
+            ep_id: None,
             title: info.title.clone(),
             part: page.part,
             page: page.page,
@@ -290,6 +341,38 @@ mod tests {
     use crate::bilibili::{VideoInfo, VideoPage};
 
     #[test]
+    #[ignore = "requires live Bilibili PGC network access"]
+    fn resolves_bangumi_episode_season_and_media_with_pgc_playback() {
+        let mut client = BiliClient::default();
+        let episode = client
+            .resolve("https://www.bilibili.com/bangumi/play/ep232465")
+            .expect("episode");
+        assert_eq!(episode.title, "工作细胞");
+        assert_eq!(episode.items.len(), 1);
+        assert_eq!(episode.items[0].ep_id, Some(232465));
+        assert!(!episode.is_collection);
+        let season = client.resolve("ss24588").expect("season");
+        let media = client.resolve("md102392").expect("media");
+        assert!(season.is_collection);
+        assert!(season.items.len() >= 14);
+        assert_eq!(season.items, media.items);
+        let movie = client.resolve("ss12548").expect("film");
+        assert_eq!(movie.title, "让子弹飞");
+        assert_eq!(movie.items[0].ep_id, Some(199612));
+        assert!(movie.items[0].duration > 7000);
+        let item = &episode.items[0];
+        let play = client
+            .play(&item.bvid, item.cid, 32, item.ep_id)
+            .expect("free episode playback");
+        assert!(!play.videos.is_empty() || !play.direct_urls.is_empty());
+        assert!(play.media_duration_ms / 1000 + 2 >= item.duration);
+        assert_eq!(
+            client.play("BV14s411J7py", 46285306, 32, Some(232466)),
+            Err(crate::bilibili::ApiError::LoginRequired)
+        );
+    }
+
+    #[test]
     #[ignore = "requires live Bilibili network access"]
     fn reads_real_public_video_metadata() {
         let mut client = BiliClient::default();
@@ -305,7 +388,9 @@ mod tests {
         let mut client = BiliClient::default();
         let info = client.video_info("BV1K2C2BSEZB").expect("public metadata");
         let page = info.pages.first().expect("first page");
-        let play = client.play(&info.bvid, page.cid, 80).expect("play data");
+        let play = client
+            .play(&info.bvid, page.cid, 80, None)
+            .expect("play data");
         assert!(play.duration_ms / 1000 < page.duration);
     }
 

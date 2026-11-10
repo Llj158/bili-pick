@@ -713,7 +713,7 @@ unsafe fn create_main_controls(window: HWND, controls: &mut Controls) {
         controls.status = child(
             window,
             "STATIC",
-            "粘贴 BV 号、视频链接或合集链接，然后点击“解析”。",
+            "粘贴视频、合集或番剧影视链接，然后点击“解析链接”。",
             base,
             ID_STATUS,
             28,
@@ -729,7 +729,7 @@ unsafe fn create_main_controls(window: HWND, controls: &mut Controls) {
             SendMessageW(control, WM_SETFONT, app.small_font as usize, 1);
         }
         SendMessageW(controls.list, LB_SETITEMHEIGHT, 0, scaled(30) as isize);
-        let cue = wide("粘贴 BV 号、视频链接或合集链接");
+        let cue = wide("粘贴 BV 号、视频、合集或番剧影视链接");
         SendMessageW(controls.input, EM_SETCUEBANNER, 0, cue.as_ptr() as isize);
         let cue = wide("留空时自动从系统 PATH 查找");
         SendMessageW(controls.ffmpeg, EM_SETCUEBANNER, 0, cue.as_ptr() as isize);
@@ -1337,7 +1337,7 @@ unsafe fn handle_event(window: HWND, app: &mut App, event: UiEvent) {
                 set_status(
                     app.controls.status,
                     &format!(
-                        "解析完成：{}，共 {} 个分 P。{}",
+                        "解析完成：{}，共 {} 项。{}",
                         content.title,
                         content.items.len(),
                         content
@@ -1498,7 +1498,7 @@ unsafe fn populate_content(app: &mut App, content: &ResolvedContent) {
             } else {
                 format!("{}s", item.duration)
             };
-            let number = if content.is_collection {
+            let number = if content.is_collection || item.ep_id.is_some() {
                 format!("{:02}", index + 1)
             } else {
                 format!("P{:02}", item.page)

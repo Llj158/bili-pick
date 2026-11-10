@@ -15,6 +15,7 @@ use std::os::windows::process::CommandExt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadItem {
     pub bvid: String,
+    pub ep_id: Option<u64>,
     pub title: String,
     pub part: String,
     pub page: u32,
@@ -213,7 +214,7 @@ pub fn download_item(
     fs::create_dir_all(output_directory)
         .map_err(|error| DownloadError::Io(format!("无法创建保存目录: {error}")))?;
     progress(DownloadEvent::Status("正在获取播放地址".to_string()));
-    let play = client.play(&item.bvid, item.cid, quality)?;
+    let play = client.play(&item.bvid, item.cid, quality, item.ep_id)?;
     if play.media_duration_ms > 0
         && is_short_preview(play.media_duration_ms as f64 / 1000.0, item.duration as f64)
     {
@@ -355,15 +356,18 @@ fn download_bytes(
 }
 
 fn output_stem(item: &DownloadItem) -> String {
-    let content = if item.page > 1 {
+    let content = if item.ep_id.is_some() {
+        format!("{} - {}", item.title, item.part)
+    } else if item.page > 1 {
         format!("{} - P{:02} {}", item.title, item.page, item.part)
     } else {
         item.title.clone()
     };
-    sanitize_filename(&format!(
-        "{:03} - {} - {}",
-        item.sequence, item.bvid, content
-    ))
+    let id = item
+        .ep_id
+        .map(|id| format!("ep{id}"))
+        .unwrap_or_else(|| item.bvid.clone());
+    sanitize_filename(&format!("{:03} - {} - {}", item.sequence, id, content))
 }
 
 fn run_ffmpeg(
@@ -454,10 +458,19 @@ fn append_manifest(
     status: &str,
 ) {
     let manifest = directory.join("下载清单.txt");
+    let id = item
+        .ep_id
+        .map(|id| format!("ep{id}"))
+        .unwrap_or_else(|| item.bvid.clone());
+    let part = if item.ep_id.is_some() {
+        item.part.clone()
+    } else {
+        format!("P{}", item.page)
+    };
     let line = format!(
-        "{}\tP{}\t{}\t{:.1}s\t{}\t{}\r\n",
-        item.bvid,
-        item.page,
+        "{}\t{}\t{}\t{:.1}s\t{}\t{}\r\n",
+        id,
+        part.replace(['\t', '\r', '\n'], " "),
         item.title.replace(['\t', '\r', '\n'], " "),
         duration_secs,
         status,
@@ -481,6 +494,26 @@ mod tests {
     use std::fs;
     use std::sync::atomic::AtomicBool;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn names_bangumi_files_by_episode_id_and_title_even_for_first_episode() {
+        let mut item = DownloadItem {
+            bvid: "BV1as411p7ae".into(),
+            ep_id: Some(232465),
+            title: "作品".into(),
+            part: "第1集 · 开场".into(),
+            page: 1,
+            cid: 10,
+            duration: 60,
+            sequence: 1,
+        };
+        assert_eq!(
+            super::output_stem(&item),
+            "001 - ep232465 - 作品 - 第1集 · 开场"
+        );
+        item.ep_id = None;
+        assert_eq!(super::output_stem(&item), "001 - BV1as411p7ae - 作品");
+    }
 
     #[test]
     fn removes_windows_illegal_filename_characters() {
@@ -533,6 +566,7 @@ mod tests {
         let tools = discover_tools(None).expect("ffmpeg tools");
         let item = DownloadItem {
             bvid: "BV1K2C2BSEZB".to_string(),
+            ep_id: None,
             title: "FlowMatching".to_string(),
             part: "FlowMatching".to_string(),
             page: 1,

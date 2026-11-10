@@ -4,6 +4,9 @@ use std::fmt;
 pub enum InputTarget {
     Video(String),
     Season { mid: u64, season_id: u64 },
+    BangumiEpisode(u64),
+    BangumiSeason(u64),
+    BangumiMedia(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +50,21 @@ pub struct SeasonArchive {
 pub struct SeasonPage {
     pub total: u32,
     pub archives: Vec<SeasonArchive>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BangumiEpisode {
+    pub id: u64,
+    pub bvid: String,
+    pub cid: u64,
+    pub title: String,
+    pub duration: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BangumiInfo {
+    pub title: String,
+    pub episodes: Vec<BangumiEpisode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +119,32 @@ pub struct BiliInput {
 
 pub fn parse_input(input: &str) -> Result<BiliInput, String> {
     let value = input.trim();
+    let bangumi_id = value
+        .strip_prefix("https://www.bilibili.com/bangumi/play/")
+        .or_else(|| value.strip_prefix("https://www.bilibili.com/bangumi/media/"))
+        .or_else(|| value.strip_prefix("https://bilibili.com/bangumi/play/"))
+        .or_else(|| value.strip_prefix("https://bilibili.com/bangumi/media/"))
+        .unwrap_or(value)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    for prefix in ["ep", "ss", "md"] {
+        if let Some(raw_id) = bangumi_id.strip_prefix(prefix) {
+            let id = raw_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| "番剧或影视链接中的 ID 无效".to_string())?;
+            return Ok(BiliInput {
+                target: match prefix {
+                    "ep" => InputTarget::BangumiEpisode(id),
+                    "ss" => InputTarget::BangumiSeason(id),
+                    _ => InputTarget::BangumiMedia(id),
+                },
+                page: 1,
+            });
+        }
+    }
     if let Some(bvid) = find_bvid(value) {
         return Ok(BiliInput {
             target: InputTarget::Video(bvid.to_string()),
@@ -137,7 +181,7 @@ pub fn parse_input(input: &str) -> Result<BiliInput, String> {
             });
         }
     }
-    Err("请输入 BV 号、视频链接或合集链接".to_string())
+    Err("请输入 BV 号、视频、合集或番剧影视链接（ep / ss / md）".to_string())
 }
 
 fn find_bvid(value: &str) -> Option<&str> {
@@ -367,9 +411,30 @@ pub fn parse_season_response(input: &str, expected_season_id: u64) -> Result<Sea
 
 pub fn parse_play_response(input: &str) -> Result<PlayData, ApiError> {
     let root = parse_api_root(input)?;
-    let data = root
+    let envelope = root
         .get("data")
-        .ok_or_else(|| ApiError::Message("播放信息响应缺少 data".to_string()))?;
+        .filter(|value| value.is_object())
+        .or_else(|| root.get("result").filter(|value| value.is_object()))
+        .ok_or_else(|| ApiError::Message("播放信息响应缺少 data 或 result".to_string()))?;
+    let data = envelope.get("video_info").unwrap_or(envelope);
+    let flagged = |value: Option<&serde_json::Value>| {
+        value.is_some_and(|value| value == true || value.as_u64().is_some_and(|v| v > 0))
+    };
+    if flagged(data.get("is_drm")) {
+        return Err(ApiError::PermissionDenied(
+            "该内容使用 DRM 加密，当前版本不支持下载".to_string(),
+        ));
+    }
+    if flagged(data.get("is_preview"))
+        || envelope
+            .pointer("/play_check/play_detail")
+            .and_then(serde_json::Value::as_str)
+            == Some("PLAY_PREVIEW")
+    {
+        return Err(ApiError::PermissionDenied(
+            "平台仅返回试看片段，需要具备大会员、购买或其他观看权限".to_string(),
+        ));
+    }
     let ids: Vec<u32> = data
         .get("accept_quality")
         .and_then(serde_json::Value::as_array)
@@ -395,7 +460,7 @@ pub fn parse_play_response(input: &str) -> Result<PlayData, ApiError> {
     let descriptions: Vec<&str> = descriptions.iter().map(String::as_str).collect();
     let videos = parse_streams(data.pointer("/dash/video"));
     let audios = parse_streams(data.pointer("/dash/audio"));
-    let direct_urls = data
+    let direct_urls: Vec<String> = data
         .get("durl")
         .and_then(serde_json::Value::as_array)
         .map(|segments| {
@@ -407,6 +472,11 @@ pub fn parse_play_response(input: &str) -> Result<PlayData, ApiError> {
                 .collect()
         })
         .unwrap_or_default();
+    if videos.is_empty() && direct_urls.is_empty() {
+        return Err(ApiError::PermissionDenied(
+            "平台未返回可下载的视频流，请检查账号权限、地区或内容状态".to_string(),
+        ));
+    }
     let direct_size = data
         .get("durl")
         .and_then(serde_json::Value::as_array)
@@ -445,6 +515,85 @@ pub fn parse_play_response(input: &str) -> Result<PlayData, ApiError> {
             duration_ms
         },
     })
+}
+
+pub fn parse_bangumi_response(input: &str) -> Result<BangumiInfo, ApiError> {
+    let root = parse_api_root(input)?;
+    let data = root
+        .get("result")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| ApiError::Message("番剧影视响应缺少 result".to_string()))?;
+    let mut episodes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let main = data
+        .get("episodes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten();
+    let extras = data
+        .get("section")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|section| {
+            section
+                .get("episodes")
+                .and_then(serde_json::Value::as_array)
+        })
+        .flatten();
+    for episode in main.chain(extras) {
+        let Some(id) = u64_field(episode, "id").filter(|id| *id > 0) else {
+            continue;
+        };
+        let Some(cid) = u64_field(episode, "cid").filter(|cid| *cid > 0) else {
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        let short = episode
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let long = episode
+            .get("long_title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let title = if short.parse::<u32>().is_ok() {
+            format!("第{short}集")
+        } else {
+            short.to_string()
+        };
+        episodes.push(BangumiEpisode {
+            id,
+            bvid: episode
+                .get("bvid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            cid,
+            title: [title.as_str(), long]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · "),
+            duration: u64_field(episode, "duration")
+                .unwrap_or_default()
+                .div_ceil(1000),
+        });
+    }
+    Ok(BangumiInfo {
+        title: string_field(data, "title")?,
+        episodes,
+    })
+}
+
+pub fn parse_media_season_id(input: &str) -> Result<u64, ApiError> {
+    let root = parse_api_root(input)?;
+    root.pointer("/result/media/season_id")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| ApiError::Message("影视详情响应缺少有效的 season_id".to_string()))
 }
 
 pub fn is_official_qr_url(url: &str) -> bool {
@@ -511,9 +660,19 @@ fn parse_api_root(input: &str) -> Result<serde_json::Value, ApiError> {
         .to_string();
     if code == -101 || message.contains("登录") {
         Err(ApiError::LoginRequired)
-    } else if ["大会员", "充电", "权限", "专享", "付费", "购买"]
-        .iter()
-        .any(|word| message.contains(word))
+    } else if [
+        "大会员",
+        "充电",
+        "权限",
+        "专享",
+        "付费",
+        "购买",
+        "地区",
+        "区域",
+        "版权",
+    ]
+    .iter()
+    .any(|word| message.contains(word))
     {
         Err(ApiError::PermissionDenied(message))
     } else {
@@ -544,6 +703,13 @@ fn parse_streams(value: Option<&serde_json::Value>) -> Vec<MediaStream> {
         .map(|streams| {
             streams
                 .iter()
+                .filter(|stream| {
+                    stream
+                        .get("drm_tech_type")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        == 0
+                })
                 .filter_map(|stream| {
                     Some(MediaStream {
                         id: stream.get("id")?.as_u64()? as u32,
@@ -585,6 +751,129 @@ mod tests {
         parse_view_response, quality_options, select_audio_stream, select_video_stream,
         wbi_signed_query,
     };
+
+    #[test]
+    fn parses_bangumi_episode_season_and_media_links() {
+        for (input, target) in [
+            ("ep232465", InputTarget::BangumiEpisode(232465)),
+            ("ss24588", InputTarget::BangumiSeason(24588)),
+            ("md102392", InputTarget::BangumiMedia(102392)),
+            (
+                "https://www.bilibili.com/bangumi/play/ep232465/?bvid=BV1as411p7ae#reply",
+                InputTarget::BangumiEpisode(232465),
+            ),
+            (
+                "https://bilibili.com/bangumi/play/ss24588?from=search",
+                InputTarget::BangumiSeason(24588),
+            ),
+            (
+                "https://www.bilibili.com/bangumi/media/md102392/",
+                InputTarget::BangumiMedia(102392),
+            ),
+        ] {
+            assert_eq!(parse_input(input).unwrap(), BiliInput { target, page: 1 });
+        }
+        for input in [
+            "ep0",
+            "ss",
+            "md-1",
+            "epabc",
+            "ss18446744073709551616",
+            "https://evil.test/bangumi/play/ep232465",
+            "https://www.bilibili.com/cheese/play/ep232465",
+        ] {
+            assert!(parse_input(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn reads_episodes_and_bonus_sections_without_duplicates_or_unreleased_entries() {
+        let info = super::parse_bangumi_response(r#"{
+            "code":0,"result":{"title":"作品","episodes":[
+                {"id":1,"bvid":"BV1as411p7ae","cid":10,"title":"1","long_title":"开场","duration":60001},
+                {"id":2,"cid":20,"title":"2","long_title":"","duration":120000},
+                {"id":3,"cid":0,"title":"尚未上线"}
+            ],"section":[{"title":"花絮","episodes":[
+                {"id":1,"cid":10,"title":"重复"},
+                {"id":4,"cid":40,"title":"预告","long_title":"先行版","duration":30000}
+            ]}]}}"#).unwrap();
+        assert_eq!(info.title, "作品");
+        assert_eq!(
+            info.episodes.iter().map(|ep| ep.id).collect::<Vec<_>>(),
+            [1, 2, 4]
+        );
+        assert_eq!(info.episodes[0].title, "第1集 · 开场");
+        assert_eq!(info.episodes[0].duration, 61);
+        assert_eq!(info.episodes[1].bvid, "");
+        assert_eq!(info.episodes[2].title, "预告 · 先行版");
+        assert!(super::parse_bangumi_response(r#"{"code":0,"result":null}"#).is_err());
+    }
+
+    #[test]
+    fn reads_media_season_id_and_rejects_invalid_metadata() {
+        assert_eq!(
+            super::parse_media_season_id(r#"{"code":0,"result":{"media":{"season_id":24588}}}"#)
+                .unwrap(),
+            24588
+        );
+        for input in [
+            r#"{"code":0,"result":{}}"#,
+            r#"{"code":0,"result":{"media":{"season_id":0}}}"#,
+        ] {
+            assert!(super::parse_media_season_id(input).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_legacy_and_v2_pgc_playback_envelopes() {
+        let video = serde_json::json!({
+            "is_preview":0,"is_drm":false,"timelength":60000,
+            "accept_quality":[32],"accept_description":["480P"],
+            "dash":{
+                "video":[{"id":32,"base_url":"https://cdn.test/video","codecs":"avc1","bandwidth":1000}],
+                "audio":[{"id":30216,"baseUrl":"https://cdn.test/audio","codecs":"mp4a","bandwidth":100}]
+            }
+        });
+        for response in [
+            serde_json::json!({"code":0,"result":video}),
+            serde_json::json!({"code":0,"result":{"video_info":video,"play_check":{"play_detail":"PLAY_WHOLE"}}}),
+        ] {
+            let play = parse_play_response(&response.to_string()).unwrap();
+            assert_eq!(play.videos.len(), 1);
+            assert_eq!(play.audios.len(), 1);
+            assert_eq!(play.media_duration_ms, 60000);
+        }
+    }
+
+    #[test]
+    fn rejects_explicit_pgc_previews_even_when_full_duration_is_reported() {
+        for preview in [serde_json::json!(1), serde_json::json!(true)] {
+            let response = serde_json::json!({"code":0,"result":{"video_info":{
+                "is_preview":preview,"timelength":1500000,
+                "durl":[{"url":"https://cdn.test/preview","length":1500000}]
+            }}});
+            assert!(
+                matches!(parse_play_response(&response.to_string()), Err(ApiError::PermissionDenied(message)) if message.contains("试看"))
+            );
+        }
+        let response = r#"{"code":0,"result":{"video_info":{"is_preview":0},"play_check":{"play_detail":"PLAY_PREVIEW"}}}"#;
+        assert!(
+            matches!(parse_play_response(response), Err(ApiError::PermissionDenied(message)) if message.contains("试看"))
+        );
+    }
+
+    #[test]
+    fn rejects_drm_streams_and_empty_success_responses() {
+        for drm in [serde_json::json!(true), serde_json::json!(1)] {
+            let response = serde_json::json!({"code":0,"result":{"video_info":{"is_drm":drm}}});
+            assert!(
+                matches!(parse_play_response(&response.to_string()), Err(ApiError::PermissionDenied(message)) if message.contains("DRM"))
+            );
+        }
+        let encrypted = r#"{"code":0,"result":{"dash":{"video":[{"id":80,"base_url":"https://cdn.test/encrypted","codecs":"avc1","drm_tech_type":2}]}}}"#;
+        assert!(parse_play_response(encrypted).is_err());
+        assert!(parse_play_response(r#"{"code":0,"data":{}}"#).is_err());
+    }
 
     #[test]
     fn parses_bare_bv_as_first_video_page() {
